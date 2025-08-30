@@ -1,0 +1,44 @@
+def register_student():
+    name = simpledialog.askstring("Register Student", "Enter student name:")
+    if not name:
+        return
+
+    student_folder = os.path.join(known_faces_dir, name)
+    os.makedirs(student_folder, exist_ok=True)
+    messagebox.showinfo("Info", "Click 'Capture' 3 times to save images for the student.")
+
+    count = [0]  # use list to make it mutable in nested function
+
+    # Tkinter window for camera capture
+    cam_win = tk.Toplevel()
+    cam_win.title(f"Capture Images for {name}")
+
+    cam_label = tk.Label(cam_win)
+    cam_label.pack()
+
+    def capture_frame():
+        ret, frame = cap.read()
+        if ret and count[0] < 3:
+            image_path = os.path.join(student_folder, f"{count[0]+1}.jpg")
+            cv2.imwrite(image_path, frame)
+            count[0] += 1
+            print(f"Captured image {count[0]} for {name}")
+            if count[0] == 3:
+                cam_win.destroy()
+                load_known_faces()
+                messagebox.showinfo("Success", f"Student {name} registered successfully!")
+
+    def update_cam():
+        ret, frame = cap.read()
+        if ret:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(frame_rgb)
+            imgtk = ImageTk.PhotoImage(image=img)
+            cam_label.imgtk = imgtk
+            cam_label.configure(image=imgtk)
+        cam_label.after(30, update_cam)
+
+    capture_btn = tk.Button(cam_win, text="Capture", command=capture_frame)
+    capture_btn.pack(pady=5)
+
+    update_cam()

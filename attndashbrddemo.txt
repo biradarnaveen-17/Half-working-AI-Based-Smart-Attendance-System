@@ -1,0 +1,569 @@
+import tkinter as tk
+from tkinter import ttk, simpledialog, messagebox
+import cv2
+from PIL import Image, ImageTk
+import os
+import face_recognition
+import numpy as np
+from datetime import datetime, date
+import mysql.connector
+from mysql.connector import Error
+import sqlite3
+
+# -----------------------------
+# Database Manager Class
+# -----------------------------
+class DatabaseManager:
+    def __init__(self):
+        self.connection = None
+        self.connect()
+        
+    def connect(self):
+        """Create database connection with proper error handling"""
+        try:
+            self.connection = mysql.connector.connect(
+                host="localhost",
+                user="root",
+                password="",
+                database="attendance_system"
+            )
+            if self.connection.is_connected():
+                print("✅ Database connected successfully")
+                self.initialize_tables()
+                
+        except Error as e:
+            print(f"❌ MySQL connection failed: {e}")
+            self.use_fallback_database()
+    
+    def use_fallback_database(self):
+        """Fallback to SQLite if MySQL is not available"""
+        try:
+            self.connection = sqlite3.connect('attendance_fallback.db')
+            print("✅ Using SQLite fallback database")
+            self.initialize_tables()
+        except Exception as e:
+            print(f"❌ Fallback database also failed: {e}")
+            messagebox.showerror("Database Error", "Cannot connect to any database")
+    
+    def initialize_tables(self):
+        """Ensure all required tables exist"""
+        try:
+            cursor = self.connection.cursor()
+            
+            # MySQL and SQLite compatible table creation
+            if isinstance(self.connection, mysql.connector.MySQLConnection):
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS attendance (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        student_name VARCHAR(100) NOT NULL,
+                        date DATE NOT NULL,
+                        time TIME NOT NULL,
+                        confidence FLOAT DEFAULT 0.0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE KEY unique_attendance (student_name, date)
+                    )
+                """)
+            else:  # SQLite
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS attendance (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        student_name TEXT NOT NULL,
+                        date TEXT NOT NULL,
+                        time TEXT NOT NULL,
+                        confidence REAL DEFAULT 0.0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE (student_name, date)
+                    )
+                """)
+            
+            self.connection.commit()
+            print("✅ Database tables initialized")
+            
+        except Exception as e:
+            print(f"❌ Table creation failed: {e}")
+            if hasattr(self.connection, 'rollback'):
+                self.connection.rollback()
+    
+    def mark_attendance(self, student_name, confidence=0.0):
+        """Safely mark attendance with duplicate prevention"""
+        try:
+            today = date.today()
+            
+            # Check if already marked today
+            cursor = self.connection.cursor()
+            if isinstance(self.connection, mysql.connector.MySQLConnection):
+                cursor.execute(
+                    "SELECT id FROM attendance WHERE student_name = %s AND date = %s",
+                    (student_name, today)
+                )
+            else:  # SQLite
+                cursor.execute(
+                    "SELECT id FROM attendance WHERE student_name = ? AND date = ?",
+                    (student_name, str(today))
+                )
+            
+            if cursor.fetchone() is None:
+                # Insert new attendance record
+                now = datetime.now()
+                if isinstance(self.connection, mysql.connector.MySQLConnection):
+                    cursor.execute(
+                        """INSERT INTO attendance (student_name, date, time, confidence) 
+                        VALUES (%s, %s, %s, %s)""",
+                        (student_name, today, now.time(), confidence)
+                    )
+                else:  # SQLite
+                    cursor.execute(
+                        """INSERT INTO attendance (student_name, date, time, confidence) 
+                        VALUES (?, ?, ?, ?)""",
+                        (student_name, str(today), now.time().strftime("%H:%M:%S"), confidence)
+                    )
+                
+                self.connection.commit()
+                print(f"✅ Attendance marked for {student_name} with confidence {confidence:.2f}")
+                return True
+            else:
+                print(f"ℹ️ {student_name} already marked today")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Error marking attendance: {e}")
+            if hasattr(self.connection, 'rollback'):
+                self.connection.rollback()
+            return False
+    
+    def get_attendance_records(self, days=30):
+        """Get recent attendance records"""
+        try:
+            cursor = self.connection.cursor()
+            if isinstance(self.connection, mysql.connector.MySQLConnection):
+                cursor.execute("""
+                    SELECT student_name, date, time, confidence 
+                    FROM attendance 
+                    WHERE date >= CURDATE() - INTERVAL %s DAY
+                    ORDER BY date DESC, time DESC
+                """, (days,))
+            else:  # SQLite
+                cursor.execute("""
+                    SELECT student_name, date, time, confidence 
+                    FROM attendance 
+                    WHERE date >= date('now', '-%s days')
+                    ORDER BY date DESC, time DESC
+                """ % days)
+            
+            return cursor.fetchall()
+        except Exception as e:
+            print(f"❌ Error fetching attendance: {e}")
+            return []
+
+# -----------------------------
+# Face recognition setup
+# -----------------------------
+known_faces_dir = r"C:\Users\NAVEEN\Desktop\face_project\known_faces"
+known_encodings = []
+known_names = []
+
+def load_known_faces():
+    global known_encodings, known_names
+    known_encodings = []
+    known_names = []
+    for person_name in os.listdir(known_faces_dir):
+        person_folder = os.path.join(known_faces_dir, person_name)
+        if not os.path.isdir(person_folder):
+            continue
+        for image_name in os.listdir(person_folder):
+            image_path = os.path.join(person_folder, image_name)
+            image = face_recognition.load_image_file(image_path)
+            encodings = face_recognition.face_encodings(image)
+            if len(encodings) > 0:
+                known_encodings.append(encodings[0])
+                known_names.append(person_name)
+    print(f"✅ Loaded {len(known_encodings)} known faces.")
+
+load_known_faces()
+
+# -----------------------------
+# Improved Face Recognition
+# -----------------------------
+def improved_face_recognition(frame):
+    """Enhanced face recognition with confidence scoring"""
+    # Resize frame for faster processing
+    small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+    rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+    
+    # Detect faces
+    face_locations = face_recognition.face_locations(rgb_small_frame)
+    face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+    
+    results = []
+    
+    for face_encoding, face_location in zip(face_encodings, face_locations):
+        # Calculate face distances
+        face_distances = face_recognition.face_distance(known_encodings, face_encoding)
+        
+        if len(face_distances) == 0:
+            results.append(("Unknown", 0.0, face_location))
+            continue
+        
+        # Get best match
+        best_match_index = np.argmin(face_distances)
+        best_distance = face_distances[best_match_index]
+        confidence = max(0.0, min(1.0, 1 - best_distance))  # Convert to 0-1 scale
+        
+        # Apply dynamic threshold
+        if confidence > 0.6:  # Higher than default for better accuracy
+            name = known_names[best_match_index]
+            results.append((name, confidence, face_location))
+        else:
+            results.append(("Unknown", confidence, face_location))
+    
+    return results
+
+# -----------------------------
+# Modern Tkinter Window
+# -----------------------------
+root = tk.Tk()
+root.title("AI Attendance System")
+root.geometry("1200x800")
+root.configure(bg='#f5f5f5')
+
+# Initialize database
+db_manager = DatabaseManager()
+
+# Set style
+style = ttk.Style()
+style.theme_use('clam')
+
+# Configure colors
+style.configure('Header.TFrame', background='#2c3e50')
+style.configure('Card.TFrame', background='white', relief='raised', borderwidth=1)
+style.configure('Primary.TButton', background='#3498db', foreground='white', font=('Segoe UI', 10, 'bold'))
+style.configure('Secondary.TButton', background='#95a5a6', foreground='white', font=('Segoe UI', 10, 'bold'))
+style.configure('Success.TButton', background='#2ecc71', foreground='white', font=('Segoe UI', 10, 'bold'))
+
+# Header
+header_frame = tk.Frame(root, bg='#2c3e50', height=70)
+header_frame.pack(fill='x', side='top')
+header_frame.pack_propagate(False)
+
+title_label = tk.Label(header_frame, text="AI Attendance System", 
+                      font=('Segoe UI', 20, 'bold'), fg='white', bg='#2c3e50')
+title_label.pack(pady=20)
+
+# Main content frame
+main_frame = tk.Frame(root, bg='#f5f5f5', padx=20, pady=20)
+main_frame.pack(fill='both', expand=True)
+
+# Left panel for camera and controls
+left_panel = tk.Frame(main_frame, bg='#f5f5f5')
+left_panel.pack(side='left', fill='both', expand=True, padx=(0, 10))
+
+# Camera frame with card style
+camera_card = tk.Frame(left_panel, bg='white', relief='raised', borderwidth=1)
+camera_card.pack(fill='both', expand=True, pady=(0, 10))
+
+camera_header = tk.Frame(camera_card, bg='#3498db', height=40)
+camera_header.pack(fill='x', side='top')
+camera_header.pack_propagate(False)
+
+camera_title = tk.Label(camera_header, text="Live Camera Feed", 
+                       font=('Segoe UI', 12, 'bold'), fg='white', bg='#3498db')
+camera_title.pack(pady=8)
+
+camera_label = tk.Label(camera_card, bg='#34495e')
+camera_label.pack(padx=10, pady=10)
+
+# Control buttons frame
+control_frame = tk.Frame(left_panel, bg='#f5f5f5')
+control_frame.pack(fill='x', pady=10)
+
+# Right panel for attendance table
+right_panel = tk.Frame(main_frame, bg='#f5f5f5')
+right_panel.pack(side='right', fill='both', expand=True, padx=(10, 0))
+
+# Attendance card
+attendance_card = tk.Frame(right_panel, bg='white', relief='raised', borderwidth=1)
+attendance_card.pack(fill='both', expand=True)
+
+attendance_header = tk.Frame(attendance_card, bg='#2c3e50', height=40)
+attendance_header.pack(fill='x', side='top')
+attendance_header.pack_propagate(False)
+
+attendance_title = tk.Label(attendance_header, text="Attendance Records", 
+                           font=('Segoe UI', 12, 'bold'), fg='white', bg='#2c3e50')
+attendance_title.pack(pady=8)
+
+# Table frame with scrollbars
+table_frame = tk.Frame(attendance_card, bg='white')
+table_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+# Add scrollbars
+vsb = ttk.Scrollbar(table_frame, orient="vertical")
+vsb.pack(side='right', fill='y')
+
+hsb = ttk.Scrollbar(table_frame, orient="horizontal")
+hsb.pack(side='bottom', fill='x')
+
+# Attendance table
+columns = ("Name", "Date", "Time", "Confidence")
+tree = ttk.Treeview(table_frame, columns=columns, show="headings", 
+                   yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+vsb.config(command=tree.yview)
+hsb.config(command=tree.xview)
+
+# Configure columns
+tree.column("Name", width=150, anchor='w')
+tree.column("Date", width=100, anchor='center')
+tree.column("Time", width=100, anchor='center')
+tree.column("Confidence", width=80, anchor='center')
+
+for col in columns:
+    tree.heading(col, text=col)
+
+tree.pack(fill='both', expand=True)
+
+# Status bar
+status_frame = tk.Frame(root, bg='#ecf0f1', height=30)
+status_frame.pack(fill='x', side='bottom')
+status_frame.pack_propagate(False)
+
+status_label = tk.Label(status_frame, text="Ready", font=('Segoe UI', 9), 
+                       fg='#7f8c8d', bg='#ecf0f1', anchor='w')
+status_label.pack(side='left', padx=10)
+
+face_count_label = tk.Label(status_frame, text=f"Known Faces: {len(known_encodings)}", 
+                           font=('Segoe UI', 9), fg='#7f8c8d', bg='#ecf0f1', anchor='e')
+face_count_label.pack(side='right', padx=10)
+
+# -----------------------------
+# Update Attendance Table
+# -----------------------------
+def update_table():
+    for row in tree.get_children():
+        tree.delete(row)
+    records = db_manager.get_attendance_records(7)  # Last 7 days
+    for record in records:
+        tree.insert("", tk.END, values=record)
+    status_label.config(text=f"Attendance records updated: {len(records)} entries")
+
+# -----------------------------
+# Camera Processing
+# -----------------------------
+cap = cv2.VideoCapture(0)
+
+def process_faces():
+    ret, frame = cap.read()
+    if ret:
+        # Use improved face recognition
+        results = improved_face_recognition(frame)
+        
+        for name, confidence, face_location in results:
+            top, right, bottom, left = face_location
+            # Scale back up since we resized the frame
+            top, right, bottom, left = [coord * 2 for coord in [top, right, bottom, left]]
+            
+            # Mark attendance if confidence is high enough
+            if name != "Unknown" and confidence > 0.6:
+                db_manager.mark_attendance(name, confidence)
+                update_table()
+                
+            # Draw rectangle and label
+            color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
+            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+            label = f"{name} ({confidence:.2f})" if name != "Unknown" else "Unknown"
+            cv2.putText(frame, label, (left, top - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        
+        # Display the frame
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, (640, 480))
+        img = Image.fromarray(frame)
+        imgtk = ImageTk.PhotoImage(image=img)
+        camera_label.imgtk = imgtk
+        camera_label.configure(image=imgtk)
+    
+    camera_label.after(30, process_faces)
+
+# -----------------------------
+# Register New Student
+# -----------------------------
+def register_student():
+    name = simpledialog.askstring("Register Student", "Enter student name:")
+    if not name:
+        return
+
+    student_folder = os.path.join(known_faces_dir, name)
+    os.makedirs(student_folder, exist_ok=True)
+    messagebox.showinfo("Info", "Click 'Capture' 3 times to save images for the student.")
+
+    count = [0]
+
+    # Modern registration window
+    cam_win = tk.Toplevel()
+    cam_win.title(f"Capture Images for {name}")
+    cam_win.geometry("800x600")
+    cam_win.configure(bg='#f5f5f5')
+    
+    # Center the window
+    cam_win.update_idletasks()
+    x = (cam_win.winfo_screenwidth() // 2) - (800 // 2)
+    y = (cam_win.winfo_screenheight() // 2) - (600 // 2)
+    cam_win.geometry(f'800x600+{x}+{y}')
+    
+    # Header frame
+    header_frame = tk.Frame(cam_win, bg='#2c3e50', height=80)
+    header_frame.pack(fill='x', side='top')
+    header_frame.pack_propagate(False)
+    
+    title_label = tk.Label(header_frame, text=f"Registering: {name}", 
+                          font=('Segoe UI', 16, 'bold'), fg='white', bg='#2c3e50')
+    title_label.pack(pady=20)
+    
+    # Main content frame
+    content_frame = tk.Frame(cam_win, bg='#f5f5f5', padx=20, pady=20)
+    content_frame.pack(fill='both', expand=True)
+    
+    # Instructions
+    instruction_label = tk.Label(content_frame, 
+        text="Please look directly at the camera and ensure good lighting.\nClick 'Capture' 3 times from slightly different angles.",
+        font=('Segoe UI', 10), fg='#34495e', bg='#f5f5f5', wraplength=500, justify='center')
+    instruction_label.pack(pady=(0, 20))
+    
+    # Camera frame
+    cam_container = tk.Frame(content_frame, bg='#bdc3c7', padx=2, pady=2)
+    cam_container.pack(pady=(0, 20))
+    
+    cam_label = tk.Label(cam_container, bg='#34495e')
+    cam_label.pack()
+    
+    # Progress indicator
+    progress_frame = tk.Frame(content_frame, bg='#f5f5f5')
+    progress_frame.pack(pady=(0, 20))
+    
+    progress_label = tk.Label(progress_frame, text="Progress: 0/3", 
+                             font=('Segoe UI', 10, 'bold'), fg='#2c3e50', bg='#f5f5f5')
+    progress_label.pack(side='left')
+    
+    progress_bars = []
+    for i in range(3):
+        bar = tk.Frame(progress_frame, width=20, height=5, bg='#bdc3c7', relief='sunken', bd=1)
+        bar.pack(side='left', padx=2)
+        progress_bars.append(bar)
+    
+    # Button frame
+    button_frame = tk.Frame(content_frame, bg='#f5f5f5')
+    button_frame.pack(pady=10)
+
+    def capture_frame():
+        ret, frame = cap.read()
+        if ret and count[0] < 3:
+            image_path = os.path.join(student_folder, f"{count[0]+1}.jpg")
+            cv2.imwrite(image_path, frame)
+            count[0] += 1
+            
+            # Update progress
+            progress_label.config(text=f"Progress: {count[0]}/3")
+            for i in range(count[0]):
+                progress_bars[i].config(bg='#2ecc71')
+            
+            print(f"Captured image {count[0]} for {name}")
+            if count[0] == 3:
+                cam_win.destroy()
+                load_known_faces()
+                face_count_label.config(text=f"Known Faces: {len(known_encodings)}")
+                messagebox.showinfo("Success", f"Student {name} registered successfully!")
+
+    # Modern button
+    capture_btn = tk.Button(button_frame, text="CAPTURE IMAGE", command=capture_frame,
+                           font=('Segoe UI', 10, 'bold'), bg='#3498db', fg='white',
+                           activebackground='#2980b9', activeforeground='white',
+                           relief='flat', padx=20, pady=10, cursor='hand2')
+    capture_btn.pack()
+    
+    # Hover effects
+    def on_enter(e):
+        capture_btn['background'] = '#2980b9'
+    def on_leave(e):
+        capture_btn['background'] = '#3498db'
+    capture_btn.bind("<Enter>", on_enter)
+    capture_btn.bind("<Leave>", on_leave)
+
+    def update_cam():
+        ret, frame = cap.read()
+        if ret:
+            frame = cv2.resize(frame, (640, 480))
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(frame_rgb)
+            imgtk = ImageTk.PhotoImage(image=img)
+            cam_label.imgtk = imgtk
+            cam_label.configure(image=imgtk)
+        cam_label.after(30, update_cam)
+
+    update_cam()
+
+# -----------------------------
+# Manual Mark Present
+# -----------------------------
+def manual_mark():
+    student = simpledialog.askstring("Manual Attendance", "Enter student name to mark present:")
+    if student:
+        success = db_manager.mark_attendance(student, 1.0)  # Full confidence for manual entry
+        if success:
+            update_table()
+            status_label.config(text=f"Manually marked {student} present")
+            messagebox.showinfo("Success", f"{student} marked present!")
+        else:
+            messagebox.showinfo("Info", f"{student} is already marked today")
+
+# -----------------------------
+# Modern Buttons
+# -----------------------------
+def create_modern_button(parent, text, command, color='primary'):
+    color_map = {
+        'primary': ('#3498db', '#2980b9'),
+        'secondary': ('#95a5a6', '#7f8c8d'),
+        'success': ('#2ecc71', '#27ae60')
+    }
+    
+    bg_color, active_bg = color_map.get(color, ('#3498db', '#2980b9'))
+    
+    btn = tk.Button(parent, text=text, command=command,
+                   font=('Segoe UI', 10, 'bold'), bg=bg_color, fg='white',
+                   activebackground=active_bg, activeforeground='white',
+                   relief='flat', padx=15, pady=8, cursor='hand2')
+    
+    def on_enter(e):
+        btn['background'] = active_bg
+    def on_leave(e):
+        btn['background'] = bg_color
+        
+    btn.bind("<Enter>", on_enter)
+    btn.bind("<Leave>", on_leave)
+    
+    return btn
+
+# Create buttons
+register_btn = create_modern_button(control_frame, "Register New Student", register_student, 'primary')
+register_btn.pack(side='left', padx=5)
+
+manual_btn = create_modern_button(control_frame, "Manual Mark Present", manual_mark, 'success')
+manual_btn.pack(side='left', padx=5)
+
+refresh_btn = create_modern_button(control_frame, "Refresh Attendance", update_table, 'secondary')
+refresh_btn.pack(side='left', padx=5)
+
+# -----------------------------
+# Start Application
+# -----------------------------
+update_table()
+process_faces()
+
+# Handle window closing
+def on_closing():
+    cap.release()
+    if hasattr(db_manager.connection, 'close'):
+        db_manager.connection.close()
+    root.destroy()
+
+root.protocol("WM_DELETE_WINDOW", on_closing)
+root.mainloop()
